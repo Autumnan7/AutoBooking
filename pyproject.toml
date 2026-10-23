@@ -1,0 +1,28 @@
+[project]
+name = "instrument-reservation-bot"
+version = "0.1.0"
+description = "电子科技大学仪器预约自动脚本（WebVPN）"
+requires-python = ">=3.13"
+dependencies = [
+    "playwright==1.60.0",
+    "ddddocr==1.6.1",
+    "flatbuffers==25.12.19",
+    "greenlet==3.5.2",
+    "numpy==2.5.2",
+    "onnxruntime==1.29.0",
+    "opencv-python==5.0.0.93",
+    "packaging==26.3",
+    "pillow==12.3.0",
+    "protobuf==7.36.1",
+    "pyee==13.0.1",
+    "typing_extensions==4.15.0",
+]
+
+[tool.uv]
+package = false
+
+# 默认使用国内镜像源，加快依赖下载（如需恢复官方 PyPI，删除下面这段即可）
+[[tool.uv.index]]
+name = "tuna"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
+default = true
