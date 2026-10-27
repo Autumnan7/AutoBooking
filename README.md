@@ -6,7 +6,7 @@
 
 ## 一、环境准备
 
-以下命令均在**本项目根目录**下执行。
+以下命令均为 **Windows（PowerShell）** 环境，在**本项目根目录**下执行。
 
 需要 **Python 3.13**（不用自己装，uv 会自动下载）。
 
@@ -24,15 +24,56 @@ uv run python reserve.py            # 运行脚本
 - `playwright`：浏览器自动化核心
 - `ddddocr`：验证码自动识别
 
+### Chromium 下载慢 / 卡住？
+
+Chromium 内核由 Playwright 从**官方 CDN** 下载，**不走** uv 的清华镜像（那只管 Python 包）。国内直连慢或卡住时，二选一：
+
+**方式 A：临时挂本地代理**（如 Clash 默认端口 7890，仅当前 PowerShell 窗口有效）：
+
+```powershell
+$env:HTTP_PROXY  = "http://127.0.0.1:7890"
+$env:HTTPS_PROXY = "http://127.0.0.1:7890"
+uv run playwright install chromium
+```
+
+**方式 B：换 npmmirror 国内镜像**（不需要代理）：
+
+```powershell
+$env:PLAYWRIGHT_DOWNLOAD_HOST = "https://cdn.npmmirror.com/binaries/playwright"
+uv run playwright install chromium
+```
+
+> 注意：代理/镜像只在**下载浏览器内核这一次**用。日常运行脚本访问的是学校 WebVPN，请勿挂代理跑 `reserve.py`。
+
 ---
 
 ## 二、配置文件
 
-所有参数都在 `reserve.py` **顶部**，按需修改。
+所有配置都在本目录的 **`config.ini`** 中（已被 `.gitignore` 忽略，不会提交到 git，防止泄露账号）。完整格式如下，按需修改：
+
+```ini
+[account]
+student_id = 你的学号
+password = 你的密码
+
+[instrument]
+index = 1
+
+[time]
+start_range = 8,9
+end_range = 18,23
+monthly_budget = 200
+
+[date]
+start_day =
+end_day =
+```
+
+> ⚠️ 首次使用前先打开 `config.ini` 把学号密码填好；留空脚本会直接报错退出。
 
 ### 选择仪器
 
-在 `reserve.py` 顶部把 **`INSTRUMENT_INDEX`** 填成下表中的设备序号：
+把 **`[instrument] index`** 填成下表中的设备序号：
 
 | 序号 | 仪器名称 | 备注 |
 |---|---|---|
@@ -46,19 +87,18 @@ uv run python reserve.py            # 运行脚本
 
 ### 参数说明
 
-| 参数 | 含义 | 默认值 |
+| 配置项 | 含义 | 默认值 |
 |---|---|---|
-| `STUDENT_ID` | 登录学号（**必填**，留空脚本直接报错退出） | 空 |
-| `PASSWORD` | 登录密码（**必填**，留空脚本直接报错退出） | 空 |
-| `INSTRUMENT_INDEX` | 要预约的设备序号（**1-5**，见上方设备列表），必填 | `1` |
-| `INSTRUMENTS` | 内置的 5 台可选仪器列表（序号对应上方顺序），一般无需改动 | 见 `reserve.py` 顶部 |
-| `START_RANGE` | 开始时间随机区间（小时） | `(8, 9)` → 08:00~09:00 |
-| `END_RANGE` | 结束时间随机区间（小时） | `(18, 23)` → 18:00~23:00 |
-| `MONTHLY_BUDGET` | 当月预约总时长上限（小时） | `200` |
-| `START_DAY` | 开始日期（当月几号）；`None`=运行时询问 | `None` |
-| `END_DAY` | 结束日期（当月几号）；`None`=运行时询问 | `None` |
+| `[account] student_id` | 登录学号（**必填**，留空脚本直接报错退出） | 空 |
+| `[account] password` | 登录密码（**必填**，留空脚本直接报错退出） | 空 |
+| `[instrument] index` | 要预约的设备序号（**1-5**，见上方设备列表），必填 | `1` |
+| `[time] start_range` | 开始时间随机区间（小时），格式「起,止」 | `8,9` → 08:00~09:00 |
+| `[time] end_range` | 结束时间随机区间（小时），格式「起,止」 | `18,23` → 18:00~23:00 |
+| `[time] monthly_budget` | 当月预约总时长上限（小时） | `200` |
+| `[date] start_day` | 开始日期（当月几号）；留空=运行时询问 | 空 |
+| `[date] end_day` | 结束日期（当月几号）；留空=运行时询问 | 空 |
 
-时间以 **半小时** 为粒度；若总时长超出上限，脚本会自动从最长的那天往前收结束时间。
+时间以 **半小时** 为粒度；若总时长超出上限，脚本会自动从最长的那天往前收结束时间。仪器列表（含重名设备的区分策略）固定在 `reserve.py` 内，一般无需改动。
 
 ---
 
@@ -87,6 +127,7 @@ uv run python reserve.py
 ## 四、注意事项
 
 - **首次运行建议只约 1 天试水**，确认「选日期 → 选时间 → 勾选 → 提交 → 过验证码」整条链路走通，再放开全月。
+- 开始日期是**当天**时，已过去的时间格选不了：起始时间会自动顺延到「当前时间 + 1 小时」之后；若当天的起始区间（默认早上 8~9 点）已整体过去，则**自动跳过当天**、从下一个工作日开始。
 - 脚本**不会检测当天是否已预约**，若与已有预约冲突可能导致提交失败（失败日期会打印在末尾）。
 
 ### 验证码识别失败的示例
@@ -102,8 +143,9 @@ uv run python reserve.py
 | 现象 | 原因 / 处理 |
 |---|---|
 | `uv` / `playwright` 报错找不到浏览器 | 没执行 `uv run playwright install chromium`，补装即可 |
+| Chromium 下载很慢 / 卡住 | 见「一、环境准备 → Chromium 下载慢 / 卡住？」：挂本地代理或换 npmmirror 镜像 |
 | 验证码一直要手动输入 | `ddddocr` 没装好，或验证码太复杂；不影响使用，手动填即可 |
-| 约错了仪器 | `INSTRUMENT_INDEX` 填错了，按第二节编号表改对后重跑 |
+| 约错了仪器 | `config.ini` 的 `index` 填错了，按第二节编号表改对后重跑 |
 | 日期选不中 | 检查 `reserve.py` 中 `td[onclick*="YYYY-MM-DD"]` 日期格式是否与页面一致（零补齐） |
 | 整月某天失败 | 脚本会把失败日期打印在末尾 `失败日期：[...]`，可单独重跑那天 |
 
@@ -112,4 +154,5 @@ uv run python reserve.py
 ## 六、其他文件
 
 - `reserve.py`：主脚本，正常预约只用它（走 WebVPN，任何能上网的环境都能跑，不需要校园网）。
+- `config.ini`：本地账号配置（含学号密码，**不会**被 git 提交）。
 - `pyproject.toml` / `uv.lock`：依赖声明与版本锁，`uv sync` 用（下载源已默认设为清华镜像）。

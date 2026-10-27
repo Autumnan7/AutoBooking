@@ -1,27 +1,78 @@
 import calendar
+import configparser
+import io
 import random
 import re
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 
+from PIL import Image
 from playwright.sync_api import sync_playwright
 
 # 验证码 OCR（自动识别）
 try:
     from ddddocr import DdddOcr
-    _ocr = DdddOcr(show_ad=False)
+    _ocr = DdddOcr(show_ad=False, beta=True)
+    _ocr.set_ranges("0123456789+-x×÷")  # 只允许输出数字和运算符
     DDDD_OCR_AVAILABLE = True
 except Exception:
     DDDD_OCR_AVAILABLE = False
     _ocr = None
 
 # ============================================================
-# 用户配置（师弟师妹只需修改这一块，其它不要动）
+# 用户配置：全部在本目录的 config.ini 中填写（不进代码、不进 git）
+# 代码里只保留仪器列表等固定信息
 # ============================================================
-STUDENT_ID = ""                                # 登录学号（必填，留空则脚本报错退出）
-PASSWORD = ""                                   # 登录密码（必填，留空则脚本报错退出）
-INSTRUMENT_INDEX = 1   # 要预约的设备序号：1-5（对应上方列表顺序），必填；留空或越界则报错退出
+_config_path = Path(__file__).with_name("config.ini")
+_cfg = configparser.ConfigParser()
+if not _cfg.read(_config_path, encoding="utf-8-sig"):
+    raise SystemExit(
+        "✗ 未找到 config.ini：请在本目录新建 config.ini（完整格式见 README 第二节），"
+        "填好账号后重跑。"
+    )
 
-# 可选仪器列表（一般无需改动，下面的 INSTRUMENT_INDEX 序号对应本列表顺序）
+
+def _cfg_pair(section, key, default):
+    """解析「起,止」两个整数，如 start_range = 8,9 -> (8, 9)"""
+    raw = _cfg.get(section, key, fallback=",".join(map(str, default))).strip()
+    try:
+        parts = [int(x) for x in raw.replace("，", ",").split(",")]
+        if len(parts) != 2 or parts[0] > parts[1]:
+            raise ValueError
+        return parts[0], parts[1]
+    except ValueError:
+        raise SystemExit(f"✗ config.ini 中 [{section}] {key} 应为「起,止」两个整数，当前为：{raw!r}")
+
+
+def _cfg_day(section, key):
+    """解析当月几号：留空返回 None（运行时询问）"""
+    raw = _cfg.get(section, key, fallback="").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        raise SystemExit(f"✗ config.ini 中 [{section}] {key} 应为当月几号（整数）或留空。")
+
+
+STUDENT_ID = _cfg.get("account", "student_id", fallback="").strip()
+PASSWORD = _cfg.get("account", "password", fallback="").strip()
+if not STUDENT_ID or not PASSWORD:
+    raise SystemExit("✗ 请打开 config.ini 的 [account]，把 student_id 和 password 填写完整后再运行。")
+
+INSTRUMENT_INDEX = _cfg.get("instrument", "index", fallback="1").strip()
+
+START_RANGE = _cfg_pair("time", "start_range", (8, 9))     # 开始时间随机区间（小时）
+END_RANGE = _cfg_pair("time", "end_range", (18, 23))       # 结束时间随机区间（小时）
+try:
+    MONTHLY_BUDGET = int(_cfg.get("time", "monthly_budget", fallback="200"))
+except ValueError:
+    raise SystemExit("✗ config.ini 中 [time] monthly_budget 应为整数（小时）。")
+
+START_DAY = _cfg_day("date", "start_day")   # 开始日期（当月几号）；留空则运行时询问
+END_DAY = _cfg_day("date", "end_day")       # 结束日期（当月几号）；留空则运行时询问
+
+# 可选仪器列表（一般无需改动，config.ini 的 index 序号对应本列表顺序）
 INSTRUMENTS = [
     {"name": "通信场景仿真攻防对抗实验教学设备", "click": None,    "tag": ""},
     {"name": "可重构高性能无损网络实验教学设备",   "click": "first", "tag": "S2507234"},
@@ -29,13 +80,6 @@ INSTRUMENTS = [
     {"name": "可编程SDN网络技术实验教学设备",      "click": None,    "tag": ""},
     {"name": "5G-A通感一体化网络实验教学设备",     "click": None,    "tag": ""},
 ]
-
-START_DAY = None    # 开始日期（当月几号）；留 None 则运行时询问
-END_DAY = None      # 结束日期（当月几号）；留 None 则运行时询问
-
-START_RANGE = (8, 9)    # 开始时间随机区间（小时）：08:00 ~ 09:00
-END_RANGE = (18, 23)    # 结束时间随机区间（小时）：18:00 ~ 23:00
-MONTHLY_BUDGET = 200    # 当月预约总时长上限（小时）
 # ============================================================
 
 # ---- 以下为自动计算，一般无需改动 ----
@@ -46,19 +90,13 @@ _last_day = calendar.monthrange(_today.year, _today.month)[1]
 try:
     _choice = int(INSTRUMENT_INDEX)
 except (TypeError, ValueError):
-    raise SystemExit("✗ 请在 reserve.py 顶部将 INSTRUMENT_INDEX 设为 1-5 的整数（不支持运行时选择仪器）。")
+    raise SystemExit("✗ 请在 config.ini 的 [instrument] index 设为 1-5 的整数。")
 if not (1 <= _choice <= len(INSTRUMENTS)):
     raise SystemExit(f"✗ INSTRUMENT_INDEX 必须为 1 到 {len(INSTRUMENTS)} 的整数，当前为：{INSTRUMENT_INDEX!r}。")
 _chosen = INSTRUMENTS[_choice - 1]
 SEARCH_CATEGORY = _chosen["name"]
 CLICK_STRATEGY = _chosen["click"]
 print(f"已选择：{SEARCH_CATEGORY}{(' ' + _chosen['tag']) if _chosen['tag'] else ''}")
-
-# 账号 / 密码：必须在上方写死，不允许运行时输入
-if not STUDENT_ID or not PASSWORD:
-    raise SystemExit(
-        "✗ 请在 reserve.py 顶部填写 STUDENT_ID 和 PASSWORD，二者均不能为空（不支持运行时输入账号）。"
-    )
 
 # 日期范围：配置里写了 START_DAY / END_DAY 就直接用，否则运行时询问
 if START_DAY is None:
@@ -98,7 +136,16 @@ def recognize_captcha(image_bytes: bytes) -> str:
     """识别验证码图片（字节流），返回图片中的文字"""
     if not DDDD_OCR_AVAILABLE or _ocr is None:
         raise RuntimeError("ddddocr 未安装，无法自动识别验证码")
-    return str(_ocr.classification(image_bytes))
+    # 格式固定为「a 运算 b = ?」：裁掉右侧的 "=?" 再放大 3 倍，
+    # 让等号问号不参与识别；裁剪比例取宽松的 0.8，宁可残留 "=?"（解析时会忽略）
+    # 也不能切到第二位数字
+    img = Image.open(io.BytesIO(image_bytes)).convert("L")
+    w, h = img.size
+    img = img.crop((0, 0, int(w * 0.8), h))
+    img = img.resize((int(w * 0.8) * 3, h * 3), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return str(_ocr.classification(buf.getvalue()))
 
 
 def calc_captcha(text: str) -> int:
@@ -126,10 +173,16 @@ def calc_captcha(text: str) -> int:
     raise ValueError(f"未知运算符: {op}")
 
 
-def random_time_slots():
-    """开始时间随机在 START_RANGE，结束时间随机在 END_RANGE（支持半小时）"""
-    start_half = random.randint(START_RANGE[0] * 2, START_RANGE[1] * 2)  # 半小时粒度
+def random_time_slots(min_start_half=None):
+    """开始时间随机在 START_RANGE，结束时间随机在 END_RANGE（支持半小时）；
+    min_start_half：起始格下限（半小时粒度），当天预约时用于跳过已过去的时间"""
+    lo = START_RANGE[0] * 2
+    if min_start_half is not None:
+        lo = max(lo, min_start_half)
+    start_half = random.randint(lo, START_RANGE[1] * 2)  # 半小时粒度
     end_half = random.randint(END_RANGE[0] * 2, END_RANGE[1] * 2)
+    if end_half <= start_half:  # 兜底：结束至少比开始晚半小时
+        end_half = min(start_half + 1, END_RANGE[1] * 2)
     return start_half / 2, end_half / 2
 
 
@@ -147,9 +200,20 @@ def safe_click(page, locator, action_desc):
 
 
 # 预生成整月预约计划
+# 开始日期是今天时，已过去的时间格在页面上选不了：起始至少推到「下一个半点 + 1 小时缓冲」；
+# 若连 START_RANGE 的上限都来不及了（如下午才跑、起始区间是早上），则直接跳过当天
+_today_min_start_half = None
+if _today.day in DATES:
+    _now = datetime.now()
+    _today_min_start_half = _now.hour * 2 + (1 if _now.minute >= 30 else 0) + 2
+
 SCHEDULE = []
 for _day in DATES:
-    _start, _end = random_time_slots()
+    _min_half = _today_min_start_half if _day == _today.day else None
+    if _min_half is not None and _min_half > START_RANGE[1] * 2:
+        print(f"提示：今天（{_today.day} 号）的起始区间已过，无法再约当天，跳过。")
+        continue
+    _start, _end = random_time_slots(_min_half)
     SCHEDULE.append([_day, _start, _end])  # 用 list 以便后续调整
 
 # 总时长超预算时，从最长的那天开始把结束时间往前收（最少收到 18:00）
