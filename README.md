@@ -49,7 +49,7 @@ uv run playwright install chromium
 
 ## 二、配置文件
 
-所有配置都在本目录的 **`config.ini`** 中（已被 `.gitignore` 忽略，不会提交到 git，防止泄露账号）。完整格式如下，按需修改：
+所有配置都在本目录的 **`config.ini`** 中（仓库自带模板，克隆后直接改这个文件）。**填入真实学号密码后请不要再把该文件提交回 git**，防止泄露。完整格式如下，按需修改：
 
 ```ini
 [account]
@@ -154,5 +154,5 @@ uv run python reserve.py
 ## 六、其他文件
 
 - `reserve.py`：主脚本，正常预约只用它（走 WebVPN，任何能上网的环境都能跑，不需要校园网）。
-- `config.ini`：本地账号配置（含学号密码，**不会**被 git 提交）。
+- `config.ini`：配置文件（仓库自带模板；本地填好账号密码后，勿将真实值提交回 git）。
 - `pyproject.toml` / `uv.lock`：依赖声明与版本锁，`uv sync` 用（下载源已默认设为清华镜像）。
