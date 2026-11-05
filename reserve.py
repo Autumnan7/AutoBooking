@@ -1,23 +1,20 @@
 import calendar
 import configparser
-import io
+import json
 import random
 import re
+import traceback
 from datetime import date, datetime
 from pathlib import Path
 
-from PIL import Image
 from playwright.sync_api import sync_playwright
 
-# 验证码 OCR（自动识别）
+# 验证码识别（v2：分割 + 运算符几何判别 + 数字 OCR，见 captcha_ocr.py）
 try:
-    from ddddocr import DdddOcr
-    _ocr = DdddOcr(show_ad=False, beta=True)
-    _ocr.set_ranges("0123456789+-x×÷")  # 只允许输出数字和运算符
-    DDDD_OCR_AVAILABLE = True
+    import captcha_ocr
+    CAPTCHA_OCR_AVAILABLE = True
 except Exception:
-    DDDD_OCR_AVAILABLE = False
-    _ocr = None
+    CAPTCHA_OCR_AVAILABLE = False
 
 # ============================================================
 # 用户配置：全部在本目录的 config.ini 中填写（不进代码、不进 git）
@@ -68,9 +65,20 @@ try:
     MONTHLY_BUDGET = int(_cfg.get("time", "monthly_budget", fallback="200"))
 except ValueError:
     raise SystemExit("✗ config.ini 中 [time] monthly_budget 应为整数（小时）。")
+try:
+    YEARLY_TARGET = float(_cfg.get("time", "yearly_target", fallback="1700"))
+except ValueError:
+    raise SystemExit("✗ config.ini 中 [time] yearly_target 应为数字（小时）。")
 
 START_DAY = _cfg_day("date", "start_day")   # 开始日期（当月几号）；留空则运行时询问
 END_DAY = _cfg_day("date", "end_day")       # 结束日期（当月几号）；留空则运行时询问
+
+# 是否把每次验证码原图落盘到 captcha_samples/（图片 + labels.jsonl 记录），
+# 用于积累数据集（后续做模板匹配或训练识别模型都靠它）；不用时关掉
+SAVE_CAPTCHA_SAMPLES = _cfg.get("ocr", "save_samples", fallback="false").strip().lower() in ("1", "true", "yes", "on")
+SAMPLES_DIR = Path(__file__).with_name("captcha_samples")
+HISTORY_PATH = Path(__file__).with_name("booking_history.json")
+LOG_PATH = Path(__file__).with_name("reserve.log")
 
 # 可选仪器列表（一般无需改动，config.ini 的 index 序号对应本列表顺序）
 INSTRUMENTS = [
@@ -132,20 +140,111 @@ def fmt_time(hour):
     return f"{h:02d}:{m}"
 
 
+def load_history():
+    """读取 booking_history.json（{"2026-11": 小时数}）；不存在/损坏时按空记录处理。"""
+    if not HISTORY_PATH.exists():
+        return {}
+    try:
+        data = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("顶层应为 {月份: 小时数}")
+        # 兼容早期按日期记录的格式 {"bookings": {"2026-11-03": {"hours": ...}}}
+        if isinstance(data.get("bookings"), dict):
+            merged = {}
+            for key, entry in data["bookings"].items():
+                month = key[:7]
+                merged[month] = merged.get(month, 0) + float(entry.get("hours", 0))
+            return merged
+        return {k: float(v) for k, v in data.items()
+                if isinstance(v, (int, float))}
+    except Exception as exc:
+        print(f"  ⚠ 历史记录读取失败（本次按空记录处理）：{exc}")
+        return {}
+
+
+def save_history(history):
+    """原子写入，避免中途崩溃把记录写坏。"""
+    tmp = HISTORY_PATH.with_name(HISTORY_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(history, ensure_ascii=False, indent=2, sort_keys=True),
+                   encoding="utf-8")
+    tmp.replace(HISTORY_PATH)
+
+
+def record_booking(history, hours):
+    """把一次成功提交的时长累加到当前月份（每月只保留一条记录）。"""
+    key = f"{_today.year}-{_today.month:02d}"
+    history[key] = round(float(history.get(key, 0)) + hours, 2)
+    try:
+        save_history(history)
+    except Exception as exc:
+        print(f"  ⚠ 时长记录写入失败（不影响预约）：{exc}")
+
+
+def history_totals(history, year=None):
+    """返回 (该年累计小时, 该年当前月小时)。"""
+    year = year or _today.year
+    year_total = sum(float(v) for k, v in history.items()
+                     if k.startswith(f"{year}-"))
+    month_total = float(history.get(f"{year}-{_today.month:02d}", 0))
+    return year_total, month_total
+
+
+def print_history(history, title="预约时长记录", planned_hours=None):
+    """打印本月/本年累计，以及与年度目标的差额；可附带本次计划后的预计值。"""
+    year_total, month_total = history_totals(history)
+    remaining = YEARLY_TARGET - year_total
+    print()
+    print(f"========== {title} ==========")
+    print(f"  {_today.year} 年 {_today.month} 月已记录：{month_total:g} 小时")
+    if remaining > 0:
+        print(f"  {_today.year} 年累计：{year_total:g} / {YEARLY_TARGET:g} 小时"
+              f"（还差 {remaining:g} 小时）")
+    else:
+        print(f"  {_today.year} 年累计：{year_total:g} / {YEARLY_TARGET:g} 小时（已达标）")
+    if planned_hours is not None:
+        print(f"  本次计划：{planned_hours:g} 小时"
+              f"（执行后年度累计约 {year_total + planned_hours:g} 小时）")
+    print("==============================")
+
+
+def save_captcha_sample(image_bytes: bytes, *, day=None, ocr_text=None,
+                        auto_answer=None, final_answer=None, source=None):
+    """把一张验证码原图落盘，并在 labels.jsonl 追加一条记录。
+    source：auto=自动识别的答案；manual=人工输入。
+    记录同时保留识别文本与最终提交答案，方便之后清洗数据集、核对标注"""
+    if not SAVE_CAPTCHA_SAMPLES:
+        return
+    try:
+        SAMPLES_DIR.mkdir(exist_ok=True)
+        ts = datetime.now()
+        stem = ts.strftime("%Y%m%d_%H%M%S")
+        png = SAMPLES_DIR / f"{stem}.png"
+        n = 1
+        while png.exists():  # 同秒重跑时加序号，避免覆盖
+            png = SAMPLES_DIR / f"{stem}_{n}.png"
+            n += 1
+        png.write_bytes(image_bytes)
+        record = {
+            "file": png.name,
+            "time": ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "day": day,
+            "ocr_text": ocr_text,
+            "auto_answer": auto_answer,
+            "final_answer": final_answer,
+            "source": source,
+        }
+        with (SAMPLES_DIR / "labels.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"  样本已落盘：{png.name}")
+    except Exception as e:
+        print(f"  ⚠ 样本落盘失败（不影响预约）：{e}")
+
+
 def recognize_captcha(image_bytes: bytes) -> str:
-    """识别验证码图片（字节流），返回图片中的文字"""
-    if not DDDD_OCR_AVAILABLE or _ocr is None:
-        raise RuntimeError("ddddocr 未安装，无法自动识别验证码")
-    # 格式固定为「a 运算 b = ?」：裁掉右侧的 "=?" 再放大 3 倍，
-    # 让等号问号不参与识别；裁剪比例取宽松的 0.8，宁可残留 "=?"（解析时会忽略）
-    # 也不能切到第二位数字
-    img = Image.open(io.BytesIO(image_bytes)).convert("L")
-    w, h = img.size
-    img = img.crop((0, 0, int(w * 0.8), h))
-    img = img.resize((int(w * 0.8) * 3, h * 3), Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return str(_ocr.classification(buf.getvalue()))
+    """识别验证码图片（字节流），返回 "a<op>b" 形式的表达式"""
+    if not CAPTCHA_OCR_AVAILABLE:
+        raise RuntimeError("验证码识别模块不可用（ddddocr/opencv 未安装）")
+    return captcha_ocr.recognize(image_bytes)
 
 
 def calc_captcha(text: str) -> int:
@@ -154,6 +253,7 @@ def calc_captcha(text: str) -> int:
     expr = re.sub(r"\s+|\?=|=?$", "", text.strip())
     expr = expr.replace("＝", "=").replace("×", "*").replace("÷", "/")
     expr = expr.replace("x", "*").replace("X", "*")
+    expr = re.sub(r"[+\-*/]+$", "", expr)  # 模型偶尔把尾部 "=" 读成运算符，剥掉
 
     # 提取数字和运算符
     tokens = re.findall(r"\d+|[+\-*/]", expr)
@@ -186,17 +286,72 @@ def random_time_slots(min_start_half=None):
     return start_half / 2, end_half / 2
 
 
+def log_event(message):
+    """把带时间戳的明细追加到 reserve.log（控制台只打印简短信息）。"""
+    try:
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}\n")
+    except Exception:
+        pass
+
+
+def log_error(context, exc):
+    """记录上下文 + 完整堆栈；控制台不打印这一大段。"""
+    log_event(f"{context} | {type(exc).__name__}: {exc}")
+    try:
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(traceback.format_exc() + "\n")
+    except Exception:
+        pass
+
+
+def short_error(exc):
+    """异常只取第一行给控制台，避免刷屏；完整内容在 reserve.log。"""
+    text = str(exc).strip()
+    first = text.splitlines()[0] if text else type(exc).__name__
+    if "outside of the viewport" in text:
+        return f"{first}（元素在 iframe 内无法滚入可视区）"
+    return first
+
+
+class StepSkipped(Exception):
+    """某一步无法自动完成，跳过当前日期（整月批处理不做人工等待）。"""
+
+
+def skip_step(reason):
+    """记录原因并跳过当天；由每天的执行块统一捕获。"""
+    print(f"  ⏭ {reason}，跳过当天。")
+    raise StepSkipped(reason)
+
+
 def safe_click(page, locator, action_desc):
-    """点击某元素：先滚动进可视区再点；失败不崩溃，提示手动接管后回车继续"""
+    """点击某元素：先滚动进可视区再点。
+    物理点击失败时（常见于 iframe 内元素报 outside of the viewport），
+    回退到 DOM click；两者都失败才跳过当天。"""
     try:
         locator.scroll_into_view_if_needed()
+        # 页面在嵌套 iframe 里，且时间格子有自己的滚动容器：
+        # Playwright 自带滚动有时滚不到正确容器，再用 JS 强制滚到视口中间。
+        try:
+            locator.evaluate("el => el.scrollIntoView({block: 'center', inline: 'center'})")
+        except Exception:
+            pass
         page.wait_for_timeout(200)
         locator.click(timeout=8000)
         return True
     except Exception as exc:
-        print(f"  ⚠ 自动点击「{action_desc}」失败：{exc}")
-        input("  请在浏览器中手动完成该步，然后按回车继续...")
-        return False
+        log_error(f"点击「{action_desc}」失败", exc)
+        try:
+            locator.evaluate("el => el.click()")
+            print(f"  ↳ 物理点击失败，已改用 DOM click 完成「{action_desc}」")
+            log_event(f"「{action_desc}」已用 DOM click 兜底成功")
+            return True
+        except Exception as fallback_exc:
+            log_error(f"点击「{action_desc}」的 DOM click 兜底也失败", fallback_exc)
+            print(f"  ⚠ 自动点击「{action_desc}」失败：{short_error(exc)}")
+            print(f"  ↳ DOM click 兜底也失败：{short_error(fallback_exc)}"
+                  f"（完整堆栈见 {LOG_PATH.name}）")
+            skip_step(f"「{action_desc}」无法完成")
 
 
 # 预生成整月预约计划
@@ -241,6 +396,9 @@ for _day, _start, _end in SCHEDULE:
     print(f"  {(_today.month):>2}月{_day:>2}日 ({_weekday})  {fmt_time(_start)} ~ {fmt_time(_end)}  ({_hours:g}h)")
 print(f"共 {len(SCHEDULE)} 天，预计 {_total_hours:g} 小时")
 print("==============================")
+
+history = load_history()
+print_history(history, planned_hours=_total_hours)
 print()
 
 confirm = input("确认执行以上预约计划？（回车确认 / 输入 n 取消）：").strip().lower()
@@ -248,12 +406,19 @@ if confirm == "n":
     print("已取消。")
     exit()
 
+log_event("=" * 60)
+log_event(f"开始预约：{_today.year}-{_today.month:02d}，{len(SCHEDULE)} 天，"
+          f"共 {_total_hours:g} 小时")
+
 
 URL = ("https://webvpn.uestc.edu.cn/https/77726476706e69737468656265737421f4ee0f8922237c53300d8db9d6562d/customer/index/index.html")
 
 with sync_playwright() as p:
-    browser = p.chromium.launch(headless=False)
-    page = browser.new_page()
+    # 最大化窗口：默认 1280×720 视口下，预约表格靠下的时间格会落在视口外，
+    # Playwright 会拒绝点击（element is outside of the viewport）。
+    browser = p.chromium.launch(headless=False, args=["--start-maximized"])
+    context = browser.new_context(no_viewport=True)
+    page = context.new_page()
 
     # 1. 打开首页（会自动跳转到 CAS 登录页）
     print("打开 WebVPN...")
@@ -313,6 +478,7 @@ with sync_playwright() as p:
 
     # 9. 逐天预约：选择日期 + 随机时间 + 提交
     failed_days = []
+    booked_days = []
     for day, start_hour, end_hour in SCHEDULE:
         start_slot = time_to_id(start_hour)
         end_slot = time_to_id(end_hour) - 1
@@ -345,20 +511,41 @@ with sync_playwright() as p:
             safe_click(page, iframe1.get_by_text("立即提交"), "立即提交")
             page.wait_for_timeout(1000)
 
-            # 验证码（直接字节流，不落盘）
+            # 验证码（字节流；[ocr] save_samples=true 时同步落盘做数据集）
             captcha_bytes = page.locator("#img2").screenshot()
-            answer = None
-            if DDDD_OCR_AVAILABLE:
+            ocr_text = None
+            auto_answer = None
+            if not CAPTCHA_OCR_AVAILABLE:
+                skip_step("验证码识别模块不可用")
+            for attempt in range(3):
                 try:
-                    captcha_text = recognize_captcha(captcha_bytes)
-                    print(f"  验证码识别：{captcha_text}")
-                    answer = str(calc_captcha(captcha_text))
-                    print(f"  自动计算结果：{answer}")
+                    ocr_text = recognize_captcha(captcha_bytes)
+                    print(f"  验证码识别：{ocr_text}")
+                    auto_answer = str(calc_captcha(ocr_text))
+                    break
                 except Exception as e:
-                    print(f"  自动识别失败：{e}")
+                    log_error(f"{day} 号验证码识别失败（第 {attempt + 1}/3 次）", e)
+                    print(f"  验证码识别失败（第 {attempt + 1}/3 次）：{short_error(e)}")
+                    if attempt == 2:
+                        # 失败样本也落盘，方便事后分析/补标注
+                        save_captcha_sample(captcha_bytes, day=day, ocr_text=ocr_text,
+                                            auto_answer=auto_answer, final_answer=None,
+                                            source="failed")
+                        skip_step("验证码识别失败")
+                    # 验证码没加载出来/太糊：点图片刷新后重试
+                    try:
+                        page.locator("#img2").click(timeout=5000)
+                        page.wait_for_timeout(1000)
+                        captcha_bytes = page.locator("#img2").screenshot()
+                    except Exception as refresh_exc:
+                        print(f"  ⚠ 刷新验证码失败：{refresh_exc}")
+                        skip_step("验证码刷新失败")
 
-            if answer is None:
-                answer = input("  请输入验证码答案：").strip()
+            print(f"  自动计算结果：{auto_answer}")
+            answer = auto_answer
+
+            save_captcha_sample(captcha_bytes, day=day, ocr_text=ocr_text,
+                                auto_answer=auto_answer, final_answer=answer, source="auto")
 
             page.locator("#MathVerifyText").fill(answer)
 
@@ -372,18 +559,36 @@ with sync_playwright() as p:
                 confirm.click()
 
             page.wait_for_timeout(3000)
+
+            # 提交完成，把当天时长累加到本月台账
+            record_booking(history, end_hour - start_hour)
+            booked_days.append(day)
+        except StepSkipped as exc:
+            log_event(f"{day} 号跳过：{exc}")
+            print(f"  ⏭ {day} 号已跳过：{exc}")
+            failed_days.append(day)
+            page.wait_for_timeout(500)
         except Exception as exc:
-            print(f"  ✗ {day} 号预约失败：{exc}")
+            log_error(f"{day} 号预约失败", exc)
+            print(f"  ✗ {day} 号预约失败：{short_error(exc)}"
+                  f"（完整堆栈见 {LOG_PATH.name}）")
             failed_days.append(day)
             page.wait_for_timeout(500)
 
     print()
     print("==============================")
-    print(f"预约流程执行完成！成功 {len(SCHEDULE) - len(failed_days)} 天")
+    print(f"预约流程执行完成！成功 {len(booked_days)} 天，跳过/失败 {len(failed_days)} 天")
     if failed_days:
         print(f"失败日期：{failed_days}")
     print("==============================")
+
+    _run_hours = sum(e - s for d, s, e in SCHEDULE if d in booked_days)
+    if booked_days:
+        print(f"本次入账：{len(booked_days)} 天 / {_run_hours:g} 小时")
+    print_history(history, "预约时长记录（更新后）")
+    print(f"详细日志：{LOG_PATH.name}")
+    log_event(f"执行完成：成功 {len(booked_days)} 天，失败 {len(failed_days)} 天，"
+              f"失败日期 {failed_days}")
     print()
 
-    input("按 Enter 键退出浏览器...")
     browser.close()

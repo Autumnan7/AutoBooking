@@ -2,3 +2,6 @@ __pycache__/
 .venv/
 .idea/
 *.pyc
+captcha_samples/
+booking_history.json
+reserve.log
